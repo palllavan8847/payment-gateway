@@ -1,0 +1,220 @@
+import requests
+import json
+import datetime
+import re
+### below need to import from common resource which wont be shared###
+from configs.api_config import FundsTypes
+from cashout_base import CashoutBase
+
+VERSION = "1.0.0" 
+
+class Purchase(object):
+    def __init__(self, data):
+        self.id               = data["id"]
+        self.authorization    = data["authorization"]
+        self.successful       = data["successful"]
+        self.card_holder      = data["card_holder"]
+        self.card_number      = data["card_number"]
+        self.card_expiry      = data["card_expiry"]
+        self.card_token       = data["card_token"]
+        self.message          = data["message"]
+        self.amount           = data["amount"]
+        self.reference        = data["reference"]
+        self.settlement_date  = data["settlement_date"]
+        self.transaction_date = data["transaction_date"]
+        self.response_code    = data["response_code"]
+        self.captured         = data["captured"]
+        self.currency         = data["currency"]
+
+
+class CreditCard(object):
+    def __init__(self, data):
+        self.token       = data["token"]
+        self.card_number = data["card_number"]
+        self.card_holder = data["card_holder"]
+        self.expiry      = data["card_expiry"]
+        
+class GatewayError(Exception):
+    def __init__(self, errors=None):
+        self.errors = errors or []
+
+    def __str__(self):
+        return ', '.join(self.errors)
+
+class AuthenticationError(Exception):
+    pass
+
+class GatewayUnknownResponseError(Exception):
+    def __init__(self, code, response):
+        self.code = code
+        self.response = response
+
+    def __str__(self):
+        return '%s: %s' % (self.code, self.response)
+        
+class Fatzebra_Cashout(CashoutBase):
+    SANDBOX_URL = "https://gateway.sandbox.fatzebra.com.au/v1.0/"
+    LIVE_URL = "https://gateway.fatzebra.com.au/v1.0/"
+
+    def __init__(self, username="TEST", token="TEST", sandbox=True):
+        """
+        Initialize the gateway
+        Keyword arguments:
+            username - the gateway username (default: "TEST")
+            token    - the gateway token (default: "TEST")
+            sandbox  - enable or disable sandbox mode (default: True)
+        """
+        self.username = username
+        self.token = token
+        self.sandbox = sandbox
+
+    def tokenize(self, card_holder, card_number, expiry, security_code):
+        """
+        Tokenize a card for future transactions
+        Keyword arguments:
+            card_holder   - the card holders name
+            card_number   - the credit card number
+            expiry        - the card expiry date in the format of mm/yyyy
+                            (e.g. 05/2014)
+            security_code - the card security code (aka cvv, csc, cv2 etc)
+        """
+        payload = {
+            'card_number': card_number,
+            'card_holder': card_holder,
+            'card_expiry': expiry,
+            'cvv': security_code
+        }
+        json_data = self._make_request('post', "credit_cards", payload)
+
+        if json_data["successful"]:
+            return CreditCard(json_data["response"])
+        else:
+            raise GatewayError(json_data["errors"])
+    
+    def input_validation(self, payload):
+        """
+        Validates the direct credit input data
+            description         - Unique description. Max 18 characters. Allowed characters are A-Z, 0-9, period, hyphen, and underscore. Mandatory
+            amount              - the amount for the transaction (integer) - Minimum 0.01 - positive only. Mandatory
+            bsb                 - Format: ###-### Mandatory
+            account_name        - Destination account name. Max 32 characters. Mandatory
+            account_number      - Destination account number. Max 9 digits Mandatory
+        Returns True or raises GatewayError
+        if validation fails.
+        """
+        if not re.match(r"[0-9]{3}-[0-9]{3}", payload['bsb']):
+            raise GatewayError("Bsb should match proper format")
+        if float(payload['amount']) < 0.01:
+            raise Exception("Minimum amount to transfer is 0.01 but the input amount is %s"%payload['amount'])
+        if len(payload['account_name']) > 32 : 
+            raise Exception("Account name should not exceed 32 characters but the input account name %s characters is %s"%(payload['account_name'], str(len(payload['account_name']))))
+        if len(payload['account_number']) > 9 :
+            raise Exception("Account number should not exceed 9 digits but the input account number %s digit is %s"%(payload['account_number'], str(len(payload['account_number']))))
+        return True
+    
+    def process_cashout(self, input_data):
+        """
+        Perform a direct credit transaction.
+        Keyword arguments:
+            Input data          - Has the below key for direct credit in a dictionary 
+            program_id          - Integer field Mandatory
+            cid                 - card unique identification number per program Mandatory
+            customer_id         - Integer field Mandatory 
+            account_id          - Integer field Mandatory
+            amount              - the amount for the transaction (integer) - Minimum 0.01 - positive only. Mandatory
+            bank_external_card  - Integer field Mandatory
+            customer_bank_id    - Integer field Mandatory
+            batch_id            - Long Integer Mandatory
+        
+        Returns success or raises fatzebra.errors.GatewayError
+        if request fails.
+        """
+        model_obj_dict = self.input_validation(input_data)
+        with transaction.atomic():
+            primary_transaction, secondary_transaction = self.create_transaction({'card_obj': input_data['card_obj'], 
+                                                                                  'account_obj': input_data['account_obj'], 
+                                                                                  'fee_deduct': input_data['fee_deduct'],
+                                                                                  'fee_amount': input_data['fee_amount'], 
+                                                                                  'user_obj': input_data['user_obj'],
+                                                                                  'event_obj': input_data['event_obj'],
+                                                                                  'program_fee': input_data['program_fee_obj'], 
+                                                                                  'external_card': input_data['external_card_obj'], 
+																				  'program_obj': input_data['program_obj'], 
+																				  'currency': input_data['program_obj'].base_currency, 
+                                                                                  'settlement_currency': input_data['program_obj'].base_currency,
+                                                                                  'amount': input_data['amount'], 
+																				  'settlement_amount': input_data['amount'], 
+																				  'funds_type': FundsTypes.bank_account.value,
+                                                                                  'notes': 'Cashout to customer',
+                                                                                  'additional_data': {"batch_id": input_data.get('batch_id')},
+                                                                                  })
+            return self.direct_credit(self, amount, input_data['customer_bank_obj'], reference)
+        
+    def direct_credit(self, amount, customer_bank_obj, reference):
+        """
+        Perform a direct credit transaction.
+        Keyword arguments: 
+            description         - Unique description. Max 18 characters. Allowed characters are A-Z, 0-9, period, hyphen, and underscore. Mandatory
+            amount              - the amount for the transaction (integer) - Minimum 0.01 - positive only. Mandatory
+            bsb                 - Format: ###-### Mandatory
+            account_name        - Destination account name. Max 32 characters. Mandatory
+            account_number      - Destination account number. Max 9 digits Mandatory
+            
+        Returns success or raises fatzebra.errors.GatewayError
+        if request fails.
+        """
+        payload = { 
+            "amount": amount, 
+            "description": "cashout to %s"%customer_bank_obj.account_holder_name,
+            "bsb": customer_bank_obj.swift_code, 
+            "account_name": customer_bank_obj.account_holder_name, 
+            "account_number": customer_bank_obj.account_number,
+            "reference": reference
+        }
+        json_data = self._make_request('post', 'direct_credits', payload)
+        if json_data["successful"]:
+            return json_data["response"]
+        raise GatewayError(json_data["errors"])
+        
+    def query(self, reference):
+        json_data = self._make_request('get', 'purchases/' + reference)
+        if json_data["successful"]:
+            return Purchase(json_data["response"])
+        else:
+            raise GatewayError(json_data["errors"])
+ 
+    def _make_request(self, method='post', uri='purchases', payload=None):
+        """ Makes the request to the gateway, and handles the responses """
+        payload = payload or {}
+        response = requests.request(
+            method.lower(),
+            self._uri(uri),
+            auth=(self.username, self.token),
+            data=json.dumps(payload),
+            verify=True,
+            headers=self._headers()
+        )
+        if response.status_code == 201 or response.status_code == 200:
+            return json.loads(response.text)
+        else:
+            if response.status_code == 401:
+                raise AuthenticationError()
+            else:
+                raise GatewayUnknownResponseError(
+                    response.status_code, response.raw)
+
+    def _uri(self, method='purchases'):
+        """ Generate the URI for the request based on the settings """
+        gw = self._gateway()
+        return gw + method
+
+    def _gateway(self):
+        """ Get the gateway URL """
+        return (Gateway.SANDBOX_URL if self.sandbox else Gateway.LIVE_URL)
+
+    def _headers(self):
+        """ Builds the headers for the request """
+        return {
+            "User-Agent": "Python Library %s" %VERSION,
+            "Content-type": "application/json"
+        }
